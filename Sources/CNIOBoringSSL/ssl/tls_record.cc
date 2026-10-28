@@ -452,12 +452,15 @@ enum ssl_open_record_t ssl_process_alert(SSL *ssl, uint8_t *out_alert,
   uint16_t alert = (alert_level << 8) | alert_descr;
   ssl_do_info_callback(ssl, SSL_CB_READ_ALERT, alert);
 
-  if (alert_level == SSL3_AL_WARNING) {
-    if (alert_descr == SSL_AD_CLOSE_NOTIFY) {
-      ssl->s3->read_shutdown = ssl_shutdown_close_notify;
-      return ssl_open_record_close_notify;
-    }
+  // RFC 8446 section 6 lets TLS 1.3 peers ignore an alert's level, and some
+  // servers (Meta's) send close_notify at level fatal. Treat any close_notify
+  // as an orderly close, so the data read before it is kept.
+  if (alert_descr == SSL_AD_CLOSE_NOTIFY) {
+    ssl->s3->read_shutdown = ssl_shutdown_close_notify;
+    return ssl_open_record_close_notify;
+  }
 
+  if (alert_level == SSL3_AL_WARNING) {
     // Warning alerts do not exist in TLS 1.3, but RFC 8446 section 6.1
     // continues to define user_canceled as a signal to cancel the handshake,
     // without specifying how to handle it. JDK11 misuses it to signal
