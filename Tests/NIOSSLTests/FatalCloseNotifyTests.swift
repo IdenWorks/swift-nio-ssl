@@ -20,20 +20,37 @@ import XCTest
 
 @testable import NIOSSL
 
-/// Records what a client's TLS handler passes on: plaintext and errors.
+/// Records what a client's TLS handler passes on, in order. A reader such as
+/// NIOAsyncChannel stops at the first error or close, so order matters.
 private final class ReadRecorder: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
     var received = ByteBuffer()
     var errors: [Error] = []
+    /// "data", "inputClosed", "inactive" or "error".
+    var events: [String] = []
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         var bytes = self.unwrapInboundIn(data)
         self.received.writeBuffer(&bytes)
+        self.events.append("data")
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        if let event = event as? ChannelEvent, event == .inputClosed {
+            self.events.append("inputClosed")
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        self.events.append("inactive")
+        context.fireChannelInactive()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         self.errors.append(error)
+        self.events.append("error")
     }
 }
 
@@ -112,9 +129,10 @@ private final class RawBoringSSLServer {
 }
 
 /// BoringSSL will not send close_notify at level fatal (`SSL_send_fatal_alert`
-/// asserts against it), so this seals that alert as a TLS 1.3 record itself,
+/// asserts against it), so this seals a fatal alert as a TLS 1.3 record itself,
 /// with the server's application traffic secret.
-private func sealedFatalCloseNotify(
+private func sealedFatalAlert(
+    description: UInt8,
     serverTrafficSecret: [UInt8],
     cipherSuite: UInt16,
     sequenceNumber: UInt64
@@ -139,7 +157,7 @@ private func sealedFatalCloseNotify(
         nonce[11 - index] ^= UInt8(truncatingIfNeeded: sequenceNumber >> (8 * UInt64(index)))
     }
     // The alert, then its content type (alert, 21), per RFC 8446 section 5.2.
-    let innerPlaintext: [UInt8] = [UInt8(SSL3_AL_FATAL), UInt8(SSL_AD_CLOSE_NOTIFY), 21]
+    let innerPlaintext: [UInt8] = [UInt8(SSL3_AL_FATAL), description, 21]
     let tagLength = Int(CNIOBoringSSL_EVP_AEAD_max_overhead(aead))
     let recordLength = innerPlaintext.count + tagLength
     let header: [UInt8] = [23, 3, 3, UInt8(recordLength >> 8), UInt8(recordLength & 0xff)]
@@ -188,8 +206,43 @@ private func serverTrafficSecret(in keyLog: [String]) -> [UInt8] {
 final class FatalCloseNotifyTests: XCTestCase {
     // RFC 8446 section 6 lets TLS 1.3 peers ignore an alert's level, and some
     // servers send close_notify at level fatal. The bytes sent before it must
-    // reach the client, and the connection must end as a clean close.
-    func testFatalLevelCloseNotifyEndsTheConnectionCleanly() throws {
+    // reach the reader before the connection closes, with no error.
+    func testFatalLevelCloseNotifyDeliversTheDataThenCloses() throws {
+        let recorder = try self.receiveFinalBytesThenFatalAlert(
+            description: UInt8(SSL_AD_CLOSE_NOTIFY),
+            allowRemoteHalfClosure: false
+        )
+        XCTAssertEqual(String(buffer: recorder.received), "final bytes")
+        XCTAssertEqual(recorder.events, ["data", "inactive"], "\(recorder.errors)")
+    }
+
+    // With half-closure, the same alert ends only the input.
+    func testFatalLevelCloseNotifyWithHalfClosureDeliversTheDataThenEndsInput() throws {
+        let recorder = try self.receiveFinalBytesThenFatalAlert(
+            description: UInt8(SSL_AD_CLOSE_NOTIFY),
+            allowRemoteHalfClosure: true
+        )
+        XCTAssertEqual(String(buffer: recorder.received), "final bytes")
+        XCTAssertEqual(recorder.events, ["data", "inputClosed"], "\(recorder.errors)")
+    }
+
+    // Only close_notify changed: any other fatal alert still fails the read.
+    func testOtherFatalAlertsStillFail() throws {
+        let recorder = try self.receiveFinalBytesThenFatalAlert(
+            description: UInt8(SSL_AD_INTERNAL_ERROR),
+            allowRemoteHalfClosure: false
+        )
+        XCTAssertTrue(recorder.events.contains("error"), "\(recorder.events)")
+        XCTAssertTrue("\(recorder.errors)".contains("TLSV1_ALERT_INTERNAL_ERROR"), "\(recorder.errors)")
+    }
+
+    /// Completes a TLS 1.3 handshake between a raw BoringSSL server and an NIOSSL
+    /// client, then delivers "final bytes" and a fatal alert in one read, as a
+    /// real server's last packet would arrive.
+    private func receiveFinalBytesThenFatalAlert(
+        description: UInt8,
+        allowRemoteHalfClosure: Bool
+    ) throws -> ReadRecorder {
         let (certificate, key) = generateSelfSignedCert()
         let server = RawBoringSSLServer(certificate: certificate, key: key)
         var configuration = TLSConfiguration.makeClientConfiguration()
@@ -203,6 +256,7 @@ final class FatalCloseNotifyTests: XCTestCase {
         }
         let clientContext = try NIOSSLContext(configuration: configuration)
         let client = EmbeddedChannel()
+        client.allowRemoteHalfClosure = allowRemoteHalfClosure
         let recorder = ReadRecorder()
         try client.pipeline.syncOperations.addHandler(
             try NIOSSLClientHandler(context: clientContext, serverHostname: nil)
@@ -224,10 +278,10 @@ final class FatalCloseNotifyTests: XCTestCase {
         XCTAssertTrue(server.isHandshakeDone)
         XCTAssertEqual(server.protocolVersion, TLS1_3_VERSION)
 
-        // The last data and the alert arrive in one read, as from a real server.
         server.write("final bytes")
         var finalRead = server.takeOutput()
-        var alert = sealedFatalCloseNotify(
+        var alert = sealedFatalAlert(
+            description: description,
             serverTrafficSecret: serverTrafficSecret(in: keyLog.withLockedValue { lines in lines }),
             cipherSuite: server.cipherSuite,
             sequenceNumber: 1
@@ -235,9 +289,6 @@ final class FatalCloseNotifyTests: XCTestCase {
         finalRead.writeBuffer(&alert)
         try client.writeInbound(finalRead)
         client.pipeline.fireChannelReadComplete()
-
-        XCTAssertEqual(String(buffer: recorder.received), "final bytes")
-        XCTAssertTrue(recorder.errors.isEmpty, "\(recorder.errors)")
-        XCTAssertFalse(client.isActive)
+        return recorder
     }
 }
